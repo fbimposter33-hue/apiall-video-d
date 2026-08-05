@@ -6,8 +6,11 @@ import urllib.error
 import re
 
 # ─────────────────────────────────────────────
-#  CORS & JSON helpers
+#  Config
 # ─────────────────────────────────────────────
+RAPIDAPI_KEY  = "93e8e0c16bmsh216466a3573b948p1a4dbdjsn3069b3e2d6c0"
+RAPIDAPI_HOST = "social-media-video-downloader.p.rapidapi.com"
+
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -29,7 +32,7 @@ def err(msg: str, code: int = 400, debug_log: list = None) -> tuple:
 
 
 # ─────────────────────────────────────────────
-#  Platform detection — fixed patterns
+#  Platform detection
 # ─────────────────────────────────────────────
 PATTERNS = {
     "tiktok":    re.compile(r"(tiktok\.com/@|tiktok\.com/t/|vm\.tiktok|vt\.tiktok|tiktok\.com/v/)", re.I),
@@ -47,41 +50,36 @@ def detect_platform(url: str) -> str | None:
 
 
 # ─────────────────────────────────────────────
-#  Short URL resolver (vm.tiktok, fb.watch etc)
+#  Short URL resolver
 # ─────────────────────────────────────────────
-SHORT_DOMAINS = re.compile(r"(vm\.tiktok\.com|vt\.tiktok\.com|fb\.watch|fb\.gg|bit\.ly|tinyurl\.com|t\.co)", re.I)
+SHORT_DOMAINS = re.compile(r"(vm\.tiktok\.com|vt\.tiktok\.com|fb\.watch|fb\.gg|bit\.ly|t\.co)", re.I)
 
-def resolve_url(url: str, timeout: int = 5) -> str:
-    """Follow redirects to get final URL. Max 5 hops."""
+def resolve_url(url: str) -> str:
     if not SHORT_DOMAINS.search(url):
         return url
     try:
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "Mozilla/5.0"},
-            method="HEAD",
-        )
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}, method="HEAD")
         opener = urllib.request.build_opener(urllib.request.HTTPRedirectHandler())
-        with opener.open(req, timeout=timeout) as r:
+        with opener.open(req, timeout=5) as r:
             return r.url
     except Exception:
         try:
             req2 = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req2, timeout=timeout) as r:
+            with urllib.request.urlopen(req2, timeout=5) as r:
                 return r.url
         except Exception:
             return url
 
 
 # ─────────────────────────────────────────────
-#  HTTP helpers — Vercel-safe 8s timeout
+#  HTTP helpers
 # ─────────────────────────────────────────────
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/html, */*",
     "Accept-Language": "en-US,en;q=0.9",
 }
-TIMEOUT = 8  # Vercel free plan safe limit
+TIMEOUT = 8
 
 def http_get(url: str, headers: dict = None, timeout: int = TIMEOUT) -> bytes:
     h = {**DEFAULT_HEADERS, **(headers or {})}
@@ -116,25 +114,92 @@ def format_duration(s):
     m, sec = divmod(int(s), 60)
     return f"{m}:{sec:02d}"
 
-def cobalt_fetch(url: str) -> dict | None:
-    """Shared cobalt.tools call — used by multiple platforms."""
+
+# ─────────────────────────────────────────────
+#  RapidAPI — Social Media Video Downloader
+#  Supports: instagram, tiktok, facebook, youtube, twitter
+# ─────────────────────────────────────────────
+def rapidapi_download(url: str, log: list) -> dict | None:
+    log.append("trying: rapidapi social-media-video-downloader")
+    try:
+        api_url = f"https://{RAPIDAPI_HOST}/smvd/get/all?url={urllib.parse.quote(url, safe='')}"
+        raw = http_get(api_url, {
+            "x-rapidapi-key":  RAPIDAPI_KEY,
+            "x-rapidapi-host": RAPIDAPI_HOST,
+        })
+        j = json.loads(raw.decode("utf-8", errors="replace"))
+
+        # Response: {"success": true, "src": [...], "title": "...", "thumbnail": "..."}
+        if not j.get("success"):
+            log.append(f"fail: rapidapi — {j.get('message', 'unknown error')}")
+            return None
+
+        sources = j.get("src", []) or []
+        if not sources:
+            log.append("fail: rapidapi — no sources")
+            return None
+
+        log.append(f"success: rapidapi — {len(sources)} source(s)")
+
+        # Build links dict — each src has {url, quality, ext, size}
+        links = {}
+        for i, src in enumerate(sources):
+            src_url = src.get("url")
+            quality = src.get("quality") or src.get("ext") or f"stream_{i+1}"
+            if src_url:
+                links[str(quality)] = src_url
+
+        return {
+            "title":     j.get("title", "Video"),
+            "thumbnail": j.get("thumbnail"),
+            "duration":  format_duration(j.get("duration")),
+            "links":     links,
+        }
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode()[:200]
+        except Exception:
+            pass
+        log.append(f"fail: rapidapi HTTP {e.code} — {body}")
+        return None
+    except Exception as e:
+        log.append(f"fail: rapidapi {type(e).__name__}: {str(e)[:100]}")
+        return None
+
+
+# ─────────────────────────────────────────────
+#  cobalt.tools — universal fallback
+# ─────────────────────────────────────────────
+def cobalt_fetch(url: str, log: list) -> dict | None:
+    log.append("trying: cobalt.tools")
     try:
         req_data = json.dumps({"url": url, "vQuality": "max"}).encode()
         req = urllib.request.Request(
             "https://api.cobalt.tools/",
             data=req_data,
-            headers={**DEFAULT_HEADERS, "Accept": "application/json", "Content-Type": "application/json"},
+            headers={
+                **DEFAULT_HEADERS,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Origin": "https://cobalt.tools",
+                "Referer": "https://cobalt.tools/",
+            },
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
             j = json.loads(r.read().decode())
         status = j.get("status")
         if status in ("stream", "redirect", "tunnel") and j.get("url"):
+            log.append("success: cobalt.tools")
             return {"video": j["url"]}
         if status == "picker":
-            return {f"video_{i+1}": p.get("url") for i, p in enumerate(j.get("picker", []))}
-    except Exception:
-        pass
+            links = {f"video_{i+1}": p.get("url") for i, p in enumerate(j.get("picker", []))}
+            log.append(f"success: cobalt.tools picker {len(links)} items")
+            return links
+        log.append(f"fail: cobalt status={status} error={j.get('error','')}")
+    except Exception as e:
+        log.append(f"fail: cobalt {type(e).__name__}: {str(e)[:80]}")
     return None
 
 
@@ -142,13 +207,17 @@ def cobalt_fetch(url: str) -> dict | None:
 #  TikTok
 # ─────────────────────────────────────────────
 def download_tiktok(url: str, log: list) -> dict:
-    # Resolve short URLs first
     resolved = resolve_url(url)
     if resolved != url:
         log.append(f"resolved: {url} → {resolved}")
         url = resolved
 
-    # 1. tikwm.com
+    # 1. RapidAPI (primary)
+    r = rapidapi_download(url, log)
+    if r:
+        return {"platform": "tiktok", **r}
+
+    # 2. tikwm.com
     log.append("trying: tikwm.com")
     try:
         j = fetch_json(
@@ -172,34 +241,14 @@ def download_tiktok(url: str, log: list) -> dict:
                         "audio": d.get("music"),
                     },
                 }
-        log.append(f"fail: tikwm code={j.get('code')} msg={j.get('msg','')}")
+        log.append(f"fail: tikwm code={j.get('code')}")
     except Exception as e:
         log.append(f"fail: tikwm {e}")
 
-    # 2. cobalt.tools
-    log.append("trying: cobalt.tools")
-    links = cobalt_fetch(url)
+    # 3. cobalt.tools
+    links = cobalt_fetch(url, log)
     if links:
-        log.append("success: cobalt.tools")
         return {"platform": "tiktok", "title": "TikTok Video", "links": links}
-    log.append("fail: cobalt.tools")
-
-    # 3. ssstik.io
-    log.append("trying: ssstik.io")
-    try:
-        raw = http_post(
-            "https://ssstik.io/abc?lang=en",
-            {"id": url, "locale": "en", "tt": ""},
-            {"Referer": "https://ssstik.io/en", "Origin": "https://ssstik.io"},
-        )
-        html = raw.decode("utf-8", errors="replace")
-        m = re.search(r'href="(https?://[^"]+\.mp4[^"]*)"', html, re.I)
-        if m:
-            log.append("success: ssstik.io")
-            return {"platform": "tiktok", "title": "TikTok Video", "links": {"no_watermark": m.group(1).replace("&amp;", "&")}}
-        log.append("fail: ssstik no mp4 found")
-    except Exception as e:
-        log.append(f"fail: ssstik {e}")
 
     # 4. savetik.net
     log.append("trying: savetik.net")
@@ -211,60 +260,40 @@ def download_tiktok(url: str, log: list) -> dict:
         )
         j = json.loads(raw.decode())
         html = j.get("data", "")
-        links = re.findall(r'href="(https?://[^"]+\.mp4[^"]*)"', html, re.I)
-        if links:
+        found = re.findall(r'href="(https?://[^"]+\.mp4[^"]*)"', html, re.I)
+        if found:
             log.append("success: savetik.net")
-            return {"platform": "tiktok", "title": "TikTok Video", "links": {f"video_{i+1}": l.replace("&amp;", "&") for i, l in enumerate(links[:3])}}
+            return {"platform": "tiktok", "title": "TikTok Video", "links": {f"video_{i+1}": l.replace("&amp;", "&") for i, l in enumerate(found[:3])}}
         log.append("fail: savetik no links")
     except Exception as e:
         log.append(f"fail: savetik {e}")
 
-    # 5. snaptik fallback
-    log.append("trying: snaptik.app")
-    try:
-        raw = http_post(
-            "https://snaptik.app/abc2.php",
-            {"url": url, "lang": "en"},
-            {"Referer": "https://snaptik.app/"},
-        )
-        html = raw.decode("utf-8", errors="replace")
-        m = re.search(r'href="(https?://[^"]+\.mp4[^"]*)"', html, re.I)
-        if m:
-            log.append("success: snaptik.app")
-            return {"platform": "tiktok", "title": "TikTok Video", "links": {"sd_no_watermark": m.group(1).replace("&amp;", "&")}}
-        log.append("fail: snaptik no mp4")
-    except Exception as e:
-        log.append(f"fail: snaptik {e}")
-
-    raise ValueError("TikTok: সকল API ব্যর্থ হয়েছে। লিংক সঠিক আছে? (?debug=1 দিয়ে details দেখুন)")
+    raise ValueError("TikTok: সকল API ব্যর্থ। (?debug=1 দিয়ে details দেখুন)")
 
 
 # ─────────────────────────────────────────────
-#  Facebook — fixed Reels + fb.watch
+#  Facebook
 # ─────────────────────────────────────────────
 def download_facebook(url: str, log: list) -> dict:
-    # Resolve fb.watch / fb.gg short URLs
     resolved = resolve_url(url)
     if resolved != url:
         log.append(f"resolved: {url} → {resolved}")
         url = resolved
 
-    # 1. cobalt.tools (handles Reels well)
-    log.append("trying: cobalt.tools")
-    links = cobalt_fetch(url)
-    if links:
-        log.append("success: cobalt.tools")
-        return {"platform": "facebook", "title": "Facebook Video", "links": links}
-    log.append("fail: cobalt.tools")
+    # 1. RapidAPI (primary)
+    r = rapidapi_download(url, log)
+    if r:
+        return {"platform": "facebook", **r}
 
-    # 2. fdown.net
+    # 2. cobalt.tools
+    links = cobalt_fetch(url, log)
+    if links:
+        return {"platform": "facebook", "title": "Facebook Video", "links": links}
+
+    # 3. fdown.net
     log.append("trying: fdown.net")
     try:
-        raw = http_post(
-            "https://fdown.net/download.php",
-            {"URLz": url},
-            {"Referer": "https://fdown.net/"},
-        )
+        raw = http_post("https://fdown.net/download.php", {"URLz": url}, {"Referer": "https://fdown.net/"})
         html = raw.decode("utf-8", errors="replace")
         sd = re.search(r'id="sdlink"[^>]*href="([^"]+)"', html, re.I) or \
              re.search(r'href="([^"]+)"[^>]*id="sdlink"', html, re.I)
@@ -272,82 +301,32 @@ def download_facebook(url: str, log: list) -> dict:
              re.search(r'href="([^"]+)"[^>]*id="hdlink"', html, re.I)
         if sd:
             log.append("success: fdown.net")
-            return {
-                "platform": "facebook",
-                "title": "Facebook Video",
-                "links": {
-                    "sd": sd.group(1).replace("&amp;", "&"),
-                    "hd": hd.group(1).replace("&amp;", "&") if hd else None,
-                },
-            }
+            return {"platform": "facebook", "title": "Facebook Video", "links": {
+                "sd": sd.group(1).replace("&amp;", "&"),
+                "hd": hd.group(1).replace("&amp;", "&") if hd else None,
+            }}
         log.append("fail: fdown no sdlink")
     except Exception as e:
         log.append(f"fail: fdown {e}")
 
-    # 3. getfvid.com
-    log.append("trying: getfvid.com")
-    try:
-        j = fetch_json(f"https://getfvid.com/api?url={urllib.parse.quote(url)}&format=json")
-        if j.get("links", {}).get("sd"):
-            log.append("success: getfvid.com")
-            return {
-                "platform": "facebook",
-                "title": j.get("title", "Facebook Video"),
-                "links": {"sd": j["links"]["sd"], "hd": j["links"].get("hd")},
-            }
-        log.append(f"fail: getfvid {j.get('error','no sd link')}")
-    except Exception as e:
-        log.append(f"fail: getfvid {e}")
-
-    # 4. fbdownloader.com
-    log.append("trying: fbdownloader.com")
-    try:
-        j = fetch_json(
-            "https://fbdownloader.com/api/data",
-            {"url": url},
-            {"X-Requested-With": "XMLHttpRequest", "Referer": "https://fbdownloader.com/"},
-        )
-        link = j.get("sd") or j.get("url")
-        if link:
-            log.append("success: fbdownloader.com")
-            return {"platform": "facebook", "title": j.get("title", "Facebook Video"), "links": {"sd": link.replace("&amp;", "&")}}
-        log.append(f"fail: fbdownloader no link")
-    except Exception as e:
-        log.append(f"fail: fbdownloader {e}")
-
-    raise ValueError("Facebook: সকল API ব্যর্থ। ভিডিও কি Public আছে? (?debug=1 দিয়ে details দেখুন)")
+    raise ValueError("Facebook: সকল API ব্যর্থ। ভিডিও Public আছে? (?debug=1 দিয়ে details দেখুন)")
 
 
 # ─────────────────────────────────────────────
-#  Instagram — cobalt primary + Stories support
+#  Instagram
 # ─────────────────────────────────────────────
 def download_instagram(url: str, log: list) -> dict:
 
-    # 1. cobalt.tools (primary)
-    log.append("trying: cobalt.tools")
-    links = cobalt_fetch(url)
+    # 1. RapidAPI (primary)
+    r = rapidapi_download(url, log)
+    if r:
+        return {"platform": "instagram", **r}
+
+    # 2. cobalt.tools
+    links = cobalt_fetch(url, log)
     if links:
-        log.append("success: cobalt.tools")
         title = "Instagram Carousel" if len(links) > 1 else "Instagram Video"
         return {"platform": "instagram", "title": title, "links": links}
-    log.append("fail: cobalt.tools")
-
-    # 2. instavideosave.net
-    log.append("trying: instavideosave.net")
-    try:
-        raw = http_post(
-            "https://instavideosave.net/",
-            {"url": url},
-            {"Referer": "https://instavideosave.net/"},
-        )
-        html = raw.decode("utf-8", errors="replace")
-        m = re.search(r'href="(https?://[^"]+\.mp4[^"]*)"', html, re.I)
-        if m:
-            log.append("success: instavideosave.net")
-            return {"platform": "instagram", "title": "Instagram Video", "links": {"video": m.group(1).replace("&amp;", "&")}}
-        log.append("fail: instavideosave no mp4")
-    except Exception as e:
-        log.append(f"fail: instavideosave {e}")
 
     # 3. igram.world
     log.append("trying: igram.world")
@@ -360,63 +339,30 @@ def download_instagram(url: str, log: list) -> dict:
         media = j.get("media", [])
         if media:
             log.append("success: igram.world")
-            links = {f"video_{i+1}": item.get("url") for i, item in enumerate(media)}
-            return {"platform": "instagram", "title": "Instagram Video", "links": links}
-        log.append(f"fail: igram no media")
+            return {"platform": "instagram", "title": "Instagram Video", "links": {f"video_{i+1}": item.get("url") for i, item in enumerate(media)}}
+        log.append("fail: igram no media")
     except Exception as e:
         log.append(f"fail: igram {e}")
 
-    # 4. snapinsta.app
-    log.append("trying: snapinsta.app")
-    try:
-        raw = http_post(
-            "https://snapinsta.app/action.php",
-            {"url": url},
-            {"Referer": "https://snapinsta.app/"},
-        )
-        j = json.loads(raw.decode())
-        if j.get("url"):
-            log.append("success: snapinsta.app")
-            return {"platform": "instagram", "title": "Instagram Video", "links": {"video": j["url"]}}
-        log.append(f"fail: snapinsta no url")
-    except Exception as e:
-        log.append(f"fail: snapinsta {e}")
-
-    # 5. saveinsta.app
-    log.append("trying: saveinsta.app")
-    try:
-        raw = http_post(
-            "https://saveinsta.app/api/ajaxSearch",
-            {"q": url, "lang": "en"},
-            {"Referer": "https://saveinsta.app/", "Origin": "https://saveinsta.app"},
-        )
-        j = json.loads(raw.decode())
-        html = j.get("data", "")
-        links = re.findall(r'href="(https?://[^"]+\.mp4[^"]*)"', html, re.I)
-        if links:
-            log.append("success: saveinsta.app")
-            return {"platform": "instagram", "title": "Instagram Video", "links": {f"video_{i+1}": l.replace("&amp;", "&") for i, l in enumerate(links[:3])}}
-        log.append("fail: saveinsta no links")
-    except Exception as e:
-        log.append(f"fail: saveinsta {e}")
-
-    raise ValueError("Instagram: সকল API ব্যর্থ। Profile কি Private? (?debug=1 দিয়ে details দেখুন)")
+    raise ValueError("Instagram: সকল API ব্যর্থ। Profile Private? (?debug=1 দিয়ে details দেখুন)")
 
 
 # ─────────────────────────────────────────────
-#  YouTube — cobalt primary, direct links
+#  YouTube
 # ─────────────────────────────────────────────
 def download_youtube(url: str, log: list) -> dict:
 
-    # 1. cobalt.tools (direct link)
-    log.append("trying: cobalt.tools")
-    links = cobalt_fetch(url)
-    if links:
-        log.append("success: cobalt.tools")
-        return {"platform": "youtube", "title": "YouTube Video", "links": links}
-    log.append("fail: cobalt.tools")
+    # 1. RapidAPI (primary)
+    r = rapidapi_download(url, log)
+    if r:
+        return {"platform": "youtube", **r}
 
-    # 2. yt5s.io
+    # 2. cobalt.tools
+    links = cobalt_fetch(url, log)
+    if links:
+        return {"platform": "youtube", "title": "YouTube Video", "links": links}
+
+    # 3. yt5s.io
     log.append("trying: yt5s.io")
     try:
         j = fetch_json(
@@ -436,39 +382,7 @@ def download_youtube(url: str, log: list) -> dict:
     except Exception as e:
         log.append(f"fail: yt5s {e}")
 
-    # 3. y2mate (returns metadata + k key, not direct link)
-    log.append("trying: y2mate.com")
-    try:
-        j = fetch_json(
-            "https://www.y2mate.com/mates/analyzeV2/ajax",
-            {"k_query": url, "k_page": "home", "hl": "en", "q_auto": 0},
-            {"Referer": "https://www.y2mate.com/"},
-        )
-        if j.get("status") == "Ok":
-            links = {}
-            for fmt, items in (j.get("links", {}) or {}).items():
-                for quality, info in (items or {}).items():
-                    if isinstance(info, dict) and info.get("f") in ("mp4", "mp3"):
-                        links[f"{fmt}_{quality}"] = {
-                            "quality": info.get("q"),
-                            "size": info.get("size"),
-                            "k": info.get("k"),
-                        }
-            if links:
-                log.append("success: y2mate.com (metadata only)")
-                return {
-                    "platform": "youtube",
-                    "title": j.get("title", "YouTube Video"),
-                    "thumbnail": j.get("thumbnail"),
-                    "vid": j.get("vid"),
-                    "note": "⚠️ y2mate returns metadata only. Use k+vid to get direct link.",
-                    "links_meta": links,
-                }
-        log.append(f"fail: y2mate status={j.get('status')}")
-    except Exception as e:
-        log.append(f"fail: y2mate {e}")
-
-    raise ValueError("YouTube: সকল API ব্যর্থ। কিছুক্ষণ পরে আবার চেষ্টা করুন। (?debug=1 দিয়ে details দেখুন)")
+    raise ValueError("YouTube: সকল API ব্যর্থ। (?debug=1 দিয়ে details দেখুন)")
 
 
 # ─────────────────────────────────────────────
@@ -476,46 +390,28 @@ def download_youtube(url: str, log: list) -> dict:
 # ─────────────────────────────────────────────
 def download_twitter(url: str, log: list) -> dict:
 
-    # 1. cobalt.tools
-    log.append("trying: cobalt.tools")
-    links = cobalt_fetch(url)
-    if links:
-        log.append("success: cobalt.tools")
-        return {"platform": "twitter", "title": "Twitter/X Video", "links": links}
-    log.append("fail: cobalt.tools")
+    # 1. RapidAPI (primary)
+    r = rapidapi_download(url, log)
+    if r:
+        return {"platform": "twitter", **r}
 
-    # 2. twitsave.com
+    # 2. cobalt.tools
+    links = cobalt_fetch(url, log)
+    if links:
+        return {"platform": "twitter", "title": "Twitter/X Video", "links": links}
+
+    # 3. twitsave.com
     log.append("trying: twitsave.com")
     try:
-        raw = http_get(
-            f"https://twitsave.com/info?url={urllib.parse.quote(url)}",
-            {"Referer": "https://twitsave.com/"},
-        )
+        raw = http_get(f"https://twitsave.com/info?url={urllib.parse.quote(url)}", {"Referer": "https://twitsave.com/"})
         html = raw.decode("utf-8", errors="replace")
-        links_found = re.findall(r'href="(https://video\.twimg\.com/[^"]+\.mp4[^"]*)"', html)
-        if links_found:
+        found = re.findall(r'href="(https://video\.twimg\.com/[^"]+\.mp4[^"]*)"', html)
+        if found:
             log.append("success: twitsave.com")
-            return {"platform": "twitter", "title": "Twitter/X Video", "links": {f"quality_{i+1}": l for i, l in enumerate(links_found)}}
+            return {"platform": "twitter", "title": "Twitter/X Video", "links": {f"quality_{i+1}": l for i, l in enumerate(found)}}
         log.append("fail: twitsave no mp4")
     except Exception as e:
         log.append(f"fail: twitsave {e}")
-
-    # 3. twittervideodownloader.com
-    log.append("trying: twittervideodownloader.com")
-    try:
-        raw = http_post(
-            "https://twittervideodownloader.com/download",
-            {"tweet": url},
-            {"Referer": "https://twittervideodownloader.com/", "Origin": "https://twittervideodownloader.com"},
-        )
-        html = raw.decode("utf-8", errors="replace")
-        links_found = re.findall(r'href="(https?://[^"]+\.mp4[^"]*)"', html, re.I)
-        if links_found:
-            log.append("success: twittervideodownloader.com")
-            return {"platform": "twitter", "title": "Twitter/X Video", "links": {f"video_{i+1}": l.replace("&amp;", "&") for i, l in enumerate(links_found[:3])}}
-        log.append("fail: twittervideodownloader no mp4")
-    except Exception as e:
-        log.append(f"fail: twittervideodownloader {e}")
 
     raise ValueError("Twitter/X: ভিডিও পাওয়া যায়নি। (?debug=1 দিয়ে details দেখুন)")
 
@@ -535,29 +431,25 @@ def process(url: str, platform_override: str = None, debug: bool = False) -> tup
     if not url:
         return err("url parameter আবশ্যক", 400)
 
-    log = [] if debug else None
+    log = []
 
-    # Resolve short URLs for platform detection
     resolved = resolve_url(url)
     platform = platform_override or detect_platform(resolved) or detect_platform(url)
 
     if not platform:
-        return err(
-            "Unsupported platform. Supported: tiktok, facebook, instagram, youtube, twitter",
-            400, log
-        )
+        return err("Unsupported platform. Supported: tiktok, facebook, instagram, youtube, twitter", 400, log if debug else None)
 
     handler = HANDLERS.get(platform)
     if not handler:
-        return err(f"Platform '{platform}' এখনো সাপোর্ট নেই", 400, log)
+        return err(f"Platform '{platform}' এখনো সাপোর্ট নেই", 400, log if debug else None)
 
     try:
-        result = handler(url, log if log is not None else [])
-        return ok(result, log)
+        result = handler(url, log)
+        return ok(result, log if debug else None)
     except ValueError as e:
-        return err(str(e), 422, log)
+        return err(str(e), 422, log if debug else None)
     except Exception as e:
-        return err(f"Internal error: {str(e)}", 500, log)
+        return err(f"Internal error: {str(e)}", 500, log if debug else None)
 
 
 # ─────────────────────────────────────────────
@@ -606,6 +498,6 @@ class handler(BaseHTTPRequestHandler):
             data = dict(urllib.parse.parse_qsl(raw.decode()))
         url      = data.get("url", "").strip()
         platform = data.get("platform", "").strip().lower() or None
-        debug    = str(data.get("debug", "")).strip() == "1"
+        debug    = str(data.get("debug", "")) == "1"
         status, body = process(url, platform, debug)
         self.send_json(status, body)
